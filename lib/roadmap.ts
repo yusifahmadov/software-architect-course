@@ -400,8 +400,3 @@ export const STAGES: Stage[] = [...LEVELS, ...TRACKS];
 export const findStage = (id: string) => STAGES.find((s) => s.id === id);
 
 export const parentLevel = (t: Track) => LEVELS.find((l) => l.id === t.from)!;
-
-export const COURSE_LINKED: Record<string, "go" | "ds"> = {
-  "l0.0": "go",
-  "l0.1": "ds",
-};

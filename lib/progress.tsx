@@ -1,13 +1,13 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { COURSE_LINKED, LEVELS, type Stage } from "./roadmap";
-import { CAPSTONE_ID, LESSONS, type Lesson } from "./course";
+import { LEVELS, type Stage } from "./roadmap";
+import { CAPSTONE_ID, LANE_FOR_ROADMAP_ITEM, LESSONS, type LaneId, type Lesson } from "./course";
 
 const ROADMAP_KEY = "sar-progress-v2";
 const COURSE_KEY = "arch-l0-v1";
 
-type Flags = Record<string, boolean>;
+type Flags = Record<string, boolean | number>;
 
 const load = (key: string): Flags => {
   try {
@@ -34,7 +34,8 @@ type Progress = {
   lessonDone: (l: Lesson) => boolean;
   lessonOpen: (l: Lesson) => boolean;
   quizPassed: (id: string) => boolean;
-  passQuiz: (id: string) => void;
+  bestQuizPercent: (id: string) => number;
+  recordQuiz: (id: string, percent: number, passed: boolean) => void;
   exerciseDone: (id: string) => boolean;
   setExercise: (id: string, done: boolean) => void;
   lessonsDone: number;
@@ -66,9 +67,9 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<Progress>(() => {
     const byId = (id: string) => LESSONS.find((l) => l.id === id)!;
     const lessonDone = (l: Lesson) => !!(course["q" + l.id] && course["e" + l.id]);
-    const laneDone = (lane: "go" | "ds") =>
+    const laneDone = (lane: LaneId) =>
       LESSONS.filter((l) => l.lane === lane && l.id !== CAPSTONE_ID).every(lessonDone);
-    const itemLocked = (key: string) => (COURSE_LINKED[key] ? laneDone(COURSE_LINKED[key]) : false);
+    const itemLocked = (key: string) => (LANE_FOR_ROADMAP_ITEM[key] ? laneDone(LANE_FOR_ROADMAP_ITEM[key]) : false);
     const itemDone = (key: string) => !!roadmap[key] || itemLocked(key);
     const stageCount = (s: Stage) => s.items.filter((_, i) => itemDone(`${s.id}.${i}`)).length;
 
@@ -88,10 +89,11 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
       lessonDone,
       lessonOpen: (l) => l.requires.every((id) => lessonDone(byId(id))),
       quizPassed: (id) => !!course["q" + id],
+      bestQuizPercent: (id) => Number(course["b" + id] ?? 0),
       exerciseDone: (id) => !!course["e" + id],
       lessonsDone: LESSONS.filter(lessonDone).length,
       toggleItem: () => {},
-      passQuiz: () => {},
+      recordQuiz: () => {},
       setExercise: () => {},
       resetRoadmap: () => {},
       resetCourse: () => {},
@@ -108,7 +110,15 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
       }),
     [],
   );
-  const passQuiz = useCallback((id: string) => setCourse((c) => ({ ...c, ["q" + id]: true })), []);
+  const recordQuiz = useCallback(
+    (id: string, percent: number, passed: boolean) =>
+      setCourse((c) => ({
+        ...c,
+        ["b" + id]: Math.max(Number(c["b" + id] ?? 0), percent),
+        ...(passed ? { ["q" + id]: true } : {}),
+      })),
+    [],
+  );
   const setExercise = useCallback(
     (id: string, done: boolean) => setCourse((c) => ({ ...c, ["e" + id]: done })),
     [],
@@ -117,8 +127,8 @@ export function ProgressProvider({ children }: { children: React.ReactNode }) {
   const resetCourse = useCallback(() => setCourse({}), []);
 
   const full = useMemo(
-    () => ({ ...value, toggleItem, passQuiz, setExercise, resetRoadmap, resetCourse }),
-    [value, toggleItem, passQuiz, setExercise, resetRoadmap, resetCourse],
+    () => ({ ...value, toggleItem, recordQuiz, setExercise, resetRoadmap, resetCourse }),
+    [value, toggleItem, recordQuiz, setExercise, resetRoadmap, resetCourse],
   );
 
   return <Ctx.Provider value={full}>{children}</Ctx.Provider>;

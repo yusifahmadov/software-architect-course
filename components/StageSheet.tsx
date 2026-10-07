@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { useEffect, useRef } from "react";
-import { COURSE_LINKED, LEVELS, STAGES, findStage, parentLevel, type Level, type Track } from "@/lib/roadmap";
+import { LEVELS, STAGES, findStage, parentLevel, type Level, type Track } from "@/lib/roadmap";
+import { LANES, LANE_FOR_ROADMAP_ITEM } from "@/lib/course";
 import { useProgress } from "@/lib/progress";
 import { sessionFor, sessionHref } from "@/lib/sessions";
 
@@ -71,10 +72,10 @@ export function StageSheet({ id, onClose, onOpen }: Props) {
                       Open the lesson →
                     </Link>
                   )}
-                  {COURSE_LINKED[k] && (
+                  {LANE_FOR_ROADMAP_ITEM[k] && (
                     <span className="check-sub">
                       {locked ? "Ticked by finishing the " : "Ticks itself when you finish the "}
-                      <Link href="/course">{COURSE_LINKED[k] === "go" ? "Go" : "data structures"} path</Link> in the course.
+                      <Link href="/course">{LANES[LANE_FOR_ROADMAP_ITEM[k]].name.toLowerCase()} lane</Link> in the Go course.
                     </span>
                   )}
                 </li>

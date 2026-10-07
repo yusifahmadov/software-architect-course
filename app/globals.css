@@ -1141,11 +1141,17 @@ pre,
 .trails {
   position: sticky;
   top: 84px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  padding-right: 6px;
+  scrollbar-width: thin;
 }
 
 @media (max-width: 920px) {
   .trails {
     position: static;
+    max-height: none;
+    overflow: visible;
   }
 }
 
@@ -1181,16 +1187,14 @@ pre,
   color: var(--muted);
 }
 
-.lanes {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
+.lane + .lane {
+  margin-top: 22px;
 }
 
 .lane h3 {
-  margin: 0 0 8px;
-  font: 500 12px var(--f-mono);
-  color: var(--faint);
+  margin: 0 0 10px;
+  font: 400 13px/1.45 var(--f-sans);
+  color: var(--muted);
 }
 
 .lane h3 b {
@@ -2102,4 +2106,51 @@ pre,
 
 .snav.next {
   text-align: right;
+}
+
+.lane h3 b {
+  margin-bottom: 2px;
+}
+
+.lesson .rich-text {
+  margin-top: 8px;
+  font-size: 16px;
+}
+
+.lesson .rich-text h3 {
+  margin: 2em 0 0;
+  font: 600 19px/1.35 var(--f-sans);
+  letter-spacing: -0.015em;
+  text-transform: none;
+  color: var(--text);
+}
+
+.lesson .rich-text > h3:first-child {
+  margin-top: 0.6em;
+}
+
+.quiz-rule {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.opt.picked {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.danger {
+  color: var(--danger);
+}
+
+.quiz-foot .btn {
+  height: 36px;
+  font-size: 14px;
+}
+
+.quiz-foot .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
 }
