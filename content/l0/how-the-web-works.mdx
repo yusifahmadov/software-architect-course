@@ -1,0 +1,1809 @@
+export const meta = {
+  summary: "Follow one request from pressing Enter to the page arriving: DNS, TCP, TLS and HTTP, each measured and each built in Go. Then use that picture to design a small REST API and reason about latency, caching and retries.",
+  minutes: 75,
+  outcomes: [
+    "Explain what happens between typing a URL and receiving a response, and roughly what each step costs",
+    "Read a raw HTTP request and response, and choose correct methods, status codes and headers",
+    "Write a Go HTTP server with Go 1.22 routing, test it with httptest, and call other services with a client that has timeouts",
+    "Design a small REST API around resources and say which of its operations are safe to retry",
+    "Point to where latency, caching, TLS termination and load balancing happen in a web system",
+  ],
+};
+
+## Why this matters
+
+You build a service that calls a payment provider with `http.Get`. It works for weeks. Then the provider has a bad afternoon: it accepts connections but never answers. Your service doesn't crash. It just stops responding.
+
+Go's default HTTP client has no timeout. Every incoming request starts a goroutine that waits on `http.Get` forever. They pile up by the thousand, memory climbs, and the load balancer decides your service is dead. Nothing in your code looked wrong.
+
+A second story: a page loads in 40 ms on your laptop and takes most of a second for users on another continent. Same code, same server. Every new connection costs several network round trips before the first byte of the page is sent, and a round trip across an ocean is slow.
+
+Neither problem is visible if you think of the web as "call a URL, get a string back". Both are obvious once you know what happens underneath. This lesson follows one request from the Enter key to the response, measures each step, then builds each piece in Go.
+
+## The mental model
+
+When you type `https://example.com/` and press Enter, the browser does four things in order:
+
+1. **Find the server.** DNS turns the name `example.com` into an IP address the network can route to.
+2. **Open a connection.** TCP sets up a reliable two-way stream of bytes to that address.
+3. **Make it private.** TLS agrees on encryption keys and checks that the server really is `example.com`.
+4. **Ask and answer.** HTTP sends a request through that stream and reads the response.
+
+Here is the picture, with the time each step took in one real run (your numbers will differ with your network and location):
+
+<Diagram caption="One HTTPS request, step by step. Times are from a real run; yours will differ.">{`
+ You type https://example.com/ and press Enter
+
+ ┌─────────┐  1 DNS: "where is example.com?"  ┌───────────────┐
+ │         │ ───────────────────────────────▶ │ DNS resolver  │
+ │         │ ◀─────────────────────────────── │               │
+ │         │    "104.20.23.154"       5.2 ms  └───────────────┘
+ │         │                                  ┌───────────────┐
+ │         │  2 TCP handshake         6.6 ms  │ Web server    │
+ │ Browser │ ◀──────────────────────────────▶ │ 104.20.23.154 │
+ │         │  3 TLS handshake        25.1 ms  │ port 443      │
+ │         │ ◀──────────────────────────────▶ │               │
+ │         │  4 HTTP: GET /                   │               │
+ │         │ ───────────────────────────────▶ │               │
+ │         │ ◀─────────────────────────────── │               │
+ │         │    200 OK + page                 │               │
+ │         │    (first byte at 51.0 ms)       │               │
+ └─────────┘                                  └───────────────┘
+`}</Diagram>
+
+The numbers come from a Go program you will see later. It fetched the same page twice with one client:
+
+```text
+request 1
+  DNS lookup      5.2ms
+  TCP connect     6.6ms to 104.20.23.154:443
+  TLS handshake  25.1ms TLS 1.3
+  got conn      reused = false
+  first byte     51.0ms after start
+  status        200 OK HTTP/2.0
+request 2
+  got conn      reused = true
+  first byte     12.1ms after start
+  status        200 OK HTTP/2.0
+```
+
+The first request spent about 37 ms on steps 1 to 3 before it could even ask for the page. The second reused the open connection, skipped them, and finished in 12.1 ms.
+
+That is the most useful sentence in this lesson: **connections are expensive, requests on an open connection are cheap.** Connection pools, CDNs and HTTP/3 all follow from it.
+
+### Layers, like envelopes
+
+Each step is built on the one below. HTTP hands text to TLS, TLS encrypts it and hands it to TCP, TCP numbers the bytes and hands them to IP, and IP puts them in packets addressed to the server.
+
+<Diagram caption="One packet of the request. Each layer wraps the one inside it.">{`
+┌─────────────────────────────────────────────────────────┐
+│ IP packet    from 172.20.104.235   to 104.20.23.154     │
+│ ┌─────────────────────────────────────────────────────┐ │
+│ │ TCP segment  from port 5xxxx  to port 443  seq=...  │ │
+│ │ ┌─────────────────────────────────────────────────┐ │ │
+│ │ │ TLS record   (encrypted, unreadable on the way) │ │ │
+│ │ │ ┌─────────────────────────────────────────────┐ │ │ │
+│ │ │ │ HTTP   GET / HTTP/1.1   Host: example.com   │ │ │ │
+│ │ │ └─────────────────────────────────────────────┘ │ │ │
+│ │ └─────────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+`}</Diagram>
+
+Think of a phone call. DNS is the phone book. TCP is dialling and both sides saying "can you hear me?". TLS is checking ID and switching to a language only the two of you speak. HTTP is the conversation. Where the analogy breaks: an old phone call reserved a line, but on the internet every packet travels on its own and may take a different route. The "connection" is only bookkeeping at the two ends.
+
+The rest of the lesson zooms into each step in turn.
+
+## Finding the server: URLs and DNS
+
+### Anatomy of a URL
+
+One string has to say which protocol, which machine, which port, which thing on the server, and with which options:
+
+<Diagram caption="The parts of a URL (RFC 3986 calls the general form a URI).">{`
+ https://shop.example.com:8443/items/42?color=red&size=m#reviews
+ └─┬─┘   └──────┬───────┘ └┬─┘└───┬───┘ └──────┬───────┘ └──┬──┘
+ scheme       host        port   path        query     fragment
+`}</Diagram>
+
+- **Scheme**: the protocol. It implies a default port: 443 for `https`, 80 for `http`.
+- **Host**: the name DNS will turn into an address.
+- **Port**: usually omitted, so the scheme's default applies.
+- **Path**: which thing on the server. The server decides what it means.
+- **Query**: extra `key=value` parameters.
+- **Fragment**: a spot inside the page. The browser **never sends it to the server**.
+
+Go's `net/url` parses URLs and builds them with correct escaping:
+
+```go
+// file: main.go
+package main
+
+import (
+  "fmt"
+  "net/url"
+)
+
+func main() {
+  raw := "https://shop.example.com:8443/items/42?color=red&size=m#reviews"
+  u, err := url.Parse(raw)
+  if err != nil {
+    panic(err)
+  }
+  fmt.Println("scheme:  ", u.Scheme)
+  fmt.Println("host:    ", u.Hostname())
+  fmt.Println("port:    ", u.Port())
+  fmt.Println("path:    ", u.Path)
+  fmt.Println("query:   ", u.RawQuery)
+  fmt.Println("color:   ", u.Query().Get("color"))
+  fmt.Println("fragment:", u.Fragment)
+
+  fmt.Println("built:   ", searchURL("tea & biscuits"))
+
+  urlWithoutPort, _ := url.Parse("https://example.com/")
+  fmt.Printf("port of %s: %q\n", urlWithoutPort, urlWithoutPort.Port())
+}
+
+func searchURL(text string) string {
+  query := url.Values{}
+  query.Set("q", text)
+  u := url.URL{
+    Scheme:   "https",
+    Host:     "shop.example.com",
+    Path:     "/search",
+    RawQuery: query.Encode(),
+  }
+  return u.String()
+}
+```
+
+```text
+scheme:   https
+host:     shop.example.com
+port:     8443
+path:     /items/42
+query:    color=red&size=m
+color:    red
+fragment: reviews
+built:    https://shop.example.com/search?q=tea+%26+biscuits
+port of https://example.com/: ""
+```
+
+`searchURL` never glues strings: `url.Values` and `url.URL` do the escaping. In the built URL, the `&` in the search text became `%26`. Glue the string by hand and the server would see `q=tea ` plus a broken second parameter. The last line shows `Port()` is empty when the URL omits it; the client fills in 443 from the scheme.
+
+### DNS: names to addresses
+
+Routers only understand IP addresses such as `104.20.23.154`. People remember names, and the address behind a name changes whenever a company moves servers. The Domain Name System (DNS) is the phone book that maps one to the other, split across many servers so no single machine holds it all:
+
+<Terms>
+  <Term name="Recursive resolver">The server your machine asks, run by your ISP or a public service such as 8.8.8.8 or 1.1.1.1. It does the legwork and caches what it learns.</Term>
+  <Term name="Root servers">The top of the tree. They know who runs `.com`, `.org` and the other top-level domains.</Term>
+  <Term name="TLD servers">The servers for one top-level domain. They know which servers are responsible for each domain under it.</Term>
+  <Term name="Authoritative servers">The servers the domain owner chose. They hold the real answer.</Term>
+</Terms>
+
+<Diagram caption="A recursive resolver walks the tree when its cache is empty.">{`
+ ┌────────┐ 1 example.com? ┌───────────┐ 2 ┌─────────────────────┐
+ │ Your   │ ─────────────▶ │ Recursive │ ─▶│ Root server         │
+ │ laptop │                │ resolver  │ ◀─│ "ask a .com server" │
+ │        │                │ (8.8.8.8) │ 3 ├─────────────────────┤
+ │        │                │           │ ─▶│ .com TLD server     │
+ │        │                │   cache   │ ◀─│ "ask Cloudflare's   │
+ │        │                │           │   │  name servers"      │
+ │        │                │           │ 4 ├─────────────────────┤
+ │        │ 5 answer       │           │ ─▶│ Authoritative       │
+ │        │ ◀───────────── │           │ ◀─│ hera.ns.cloudflare  │
+ └────────┘ 104.20.23.154  └───────────┘   └─────────────────────┘
+            (TTL 300)
+`}</Diagram>
+
+You can play resolver yourself with `dig`, which ships with macOS and most Linux systems. `+norecurse` means "tell me only what you know". First a root server (`198.41.0.4` is `a.root-servers.net`):
+
+```sh
+$ dig @198.41.0.4 example.com A +norecurse +noall +authority
+com.      172800  IN  NS  l.gtld-servers.net.
+com.      172800  IN  NS  j.gtld-servers.net.
+com.      172800  IN  NS  h.gtld-servers.net.
+com.      172800  IN  NS  d.gtld-servers.net.
+...
+```
+
+It doesn't know, so it refers me to the `.com` name servers (`NS` records). One of those refers me on to Cloudflare, which runs this domain's DNS:
+
+```sh
+$ dig @a.gtld-servers.net example.com A +norecurse +noall +authority
+example.com.  172800  IN  NS  hera.ns.cloudflare.com.
+example.com.  172800  IN  NS  elliott.ns.cloudflare.com.
+```
+
+And Cloudflare's server has the answer:
+
+```sh
+$ dig @hera.ns.cloudflare.com example.com A +norecurse +noall +answer
+example.com.  300  IN  A  172.66.147.243
+example.com.  300  IN  A  104.20.23.154
+```
+
+Three round trips to three organisations for one name. A resolver only does this walk when its cache is empty, which is why the DNS step in the measurement took 5.2 ms. (Captured on 6 October 2026; your addresses and TTLs will differ.)
+
+### Record types
+
+Each DNS record has a name, a TTL, a type and a value. The common types, with values from my runs:
+
+| Type | Maps a name to | Example |
+| --- | --- | --- |
+| `A` | an IPv4 address | `example.com` → `104.20.23.154` |
+| `AAAA` | an IPv6 address | `go.dev` → `2001:4860:4802:32::15` |
+| `CNAME` | another name (an alias) | `www.github.com` → `github.com.` |
+| `MX` | mail servers, with a preference | `gmail.com` → `5 gmail-smtp-in.l.google.com.` |
+| `TXT` | free text: ownership proofs, email policy | `example.com` → `"v=spf1 -all"` |
+| `NS` | the authoritative name servers | `example.com` → `hera.ns.cloudflare.com.` |
+
+A resolver follows a `CNAME` for you:
+
+```sh
+$ dig www.github.com A +noall +answer
+www.github.com.   3592  IN  CNAME  github.com.
+github.com.       60    IN  A      140.82.121.4
+```
+
+### TTL and caching
+
+The second column is the **TTL** (time to live), in seconds: how long any cache may keep the answer. Here the alias may be cached for about an hour, the address of `github.com` for only 60 seconds.
+
+The domain owner picks the TTL. Long means fewer lookups; short means changes spread quickly. GitHub's 60 seconds says "we want to move traffic fast".
+
+This is where people get hurt. If your `A` record has a TTL of 86,400 (one day) and you move servers, some users keep reaching the old address for up to a day. Lower the TTL a day or more **before** a move, then switch.
+
+<Callout kind="deep" title="Why the TTL jumped around">
+
+I ran `dig github.com A` three times, four seconds apart, and got TTLs of 60, 9 and 52. TTLs only count down, so why? The address 8.8.8.8 is announced from many places at once (anycast), and each query can land on a different server with its own cache. "The cache" in a distributed system is usually many caches that disagree for a while.
+
+</Callout>
+
+### Looking names up from Go
+
+`net.LookupHost(name)` and `net.LookupCNAME(name)` are shorthands for methods on `net.DefaultResolver`. This program uses a `net.Resolver` with a context so every lookup has a deadline:
+
+```go
+// file: main.go
+package main
+
+import (
+  "context"
+  "errors"
+  "fmt"
+  "net"
+  "time"
+)
+
+func main() {
+  ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+  defer cancel()
+  var r net.Resolver
+
+  for _, host := range []string{"localhost", "go.dev", "www.github.com"} {
+    start := time.Now()
+    addrs, err := r.LookupHost(ctx, host)
+    if err != nil {
+      fmt.Println(host, "error:", err)
+      continue
+    }
+    fmt.Printf("%-15s %v (%s)\n", host, addrs, time.Since(start).Round(time.Millisecond))
+  }
+
+  cname, err := r.LookupCNAME(ctx, "www.github.com")
+  fmt.Println("CNAME of www.github.com:", cname, err)
+
+  mx, err := r.LookupMX(ctx, "gmail.com")
+  if err == nil && len(mx) > 0 {
+    fmt.Println("first MX of gmail.com:", mx[0].Host, "pref", mx[0].Pref)
+  }
+
+  _, err = r.LookupHost(ctx, "no-such-host.invalid")
+  var dnsErr *net.DNSError
+  if errors.As(err, &dnsErr) {
+    fmt.Println("not found:", dnsErr.IsNotFound, "|", err)
+  }
+}
+```
+
+It talks to real DNS servers, so your output will differ:
+
+```text
+localhost       [::1 127.0.0.1] (9ms)
+go.dev          [216.239.32.21 216.239.34.21 216.239.38.21 216.239.36.21 2001:4860:4802:38::15 2001:4860:4802:32::15 2001:4860:4802:34::15 2001:4860:4802:36::15] (4ms)
+www.github.com  [140.82.121.4] (47ms)
+CNAME of www.github.com: github.com. <nil>
+first MX of gmail.com: gmail-smtp-in.l.google.com. pref 5
+not found: true | lookup no-such-host.invalid: no such host
+```
+
+- `localhost` never reaches DNS. It comes from the hosts file (`/etc/hosts`), with an IPv6 (`::1`) and an IPv4 (`127.0.0.1`) loopback address.
+- `go.dev` has eight addresses. Several addresses spread clients across servers, and Go's dialer tries the next one if the first fails.
+- `www.github.com` took 47 ms against 4 ms for `go.dev`: my resolver most likely had to look it up instead of answering from cache.
+- `LookupMX` sorts by preference, so the first one is the preference-5 server.
+- A missing name is a `*net.DNSError` with `IsNotFound` set. Use `errors.As` to tell "no such host" from "the resolver timed out". (`.invalid` is reserved so it never resolves.)
+
+DNS usually travels over UDP port 53, not TCP. The next section explains the difference.
+
+## Building a connection: IP and TCP
+
+### Packets and IP addresses
+
+Networks don't carry long streams. They carry **packets**: chunks of typically up to 1,500 bytes on Ethernet and Wi-Fi, each with a source and destination IP address. Every router reads the destination and passes the packet one hop closer. No router knows the whole route.
+
+That is the Internet Protocol (IP), and it promises little. Packets can be lost, duplicated or arrive out of order.
+
+- **IPv4** addresses are 32 bits, like `104.20.23.154`. There are only about 4.3 billion.
+- **IPv6** addresses are 128 bits, like `2001:4860:4802:32::15` (`::` stands for a run of zero groups).
+
+My laptop's address is `172.20.104.235`, a **private** address (`10.x`, `172.16.x` to `172.31.x`, `192.168.x`). The router rewrites it to a public one on the way out, a trick called NAT.
+
+### Ports: which program on the machine
+
+An IP address reaches a machine. A **port** (0 to 65535) picks the program on it. Servers listen on well-known ports: 443 for HTTPS, 80 for HTTP, 53 for DNS. A client gets a temporary high port from the operating system, such as `58403`. A TCP connection is identified by four values: client IP, client port, server IP, server port. That is how one server on port 443 holds thousands of conversations.
+
+### The three-way handshake
+
+TCP (Transmission Control Protocol) turns unreliable packets into a reliable pipe. Before data moves, both sides must confirm they can hear each other and say where their byte numbering starts:
+
+<Diagram caption="The TCP three-way handshake. One round trip before the client can send data.">{`
+ Client                                         Server
+ 172.20.104.235:5xxxx                104.20.23.154:443
+   │                                                │
+   │ SYN       "let's talk; my bytes start at x"    │
+   │ ─────────────────────────────────────────────▶ │
+   │                                                │
+   │ SYN-ACK   "got x; my bytes start at y"         │
+   │ ◀───────────────────────────────────────────── │
+   │                                                │
+   │ ACK       "got y"  (data may follow at once)   │
+   │ ─────────────────────────────────────────────▶ │
+   │                                                │
+   │ ◀────────── bytes flow both ways ────────────▶ │
+`}</Diagram>
+
+The client can send data along with its ACK, so the handshake costs one **round trip time** (RTT): there and back. "TCP connect 6.6 ms" in the measurement is one RTT to a nearby Cloudflare server.
+
+### How TCP makes it reliable
+
+TCP numbers every byte with **sequence numbers**, and the receiver sends **acknowledgements** ("I have everything up to byte 5,000"). That fixes everything IP gets wrong:
+
+- **Lost packet**: no acknowledgement arrives in time, so the sender **retransmits**.
+- **Out of order**: the receiver buffers early bytes until the gap is filled.
+- **Duplicate**: the receiver already has those byte numbers and drops the copy.
+
+TCP also paces itself so a new connection starts slowly and speeds up (slow start), to avoid flooding the network.
+
+Your code sees bytes go in at one end and come out in order at the other. The price: one lost packet holds up **every byte behind it** until the retransmit arrives. This is **head-of-line blocking**, and it matters for HTTP/3.
+
+### Why connections are expensive
+
+Light in optical fibre covers roughly 200 km per millisecond. A server 6,000 km away can't have an RTT below about 60 ms, and real routes are longer than straight lines. Now count round trips for a new HTTPS request at an RTT of, say, 100 ms:
+
+| Step | Round trips | At 100 ms RTT |
+| --- | --- | --- |
+| DNS (if not cached) | 1 or more | 0 to 100+ ms |
+| TCP handshake | 1 | 100 ms |
+| TLS 1.3 handshake | 1 | 100 ms |
+| HTTP request and response | 1 | 100 ms + server time |
+| **Before the first byte** | **3 to 4** | **300 to 400 ms** |
+
+On an open connection the same request costs one round trip. That is the 51.0 ms against 12.1 ms from the mental model, at a larger scale. This table is why clients pool connections, why CDNs put servers near users, and why newer protocols fight to remove round trips.
+
+### UDP: the contrast
+
+**UDP** (User Datagram Protocol) is almost nothing: put a port on a packet and send it. No handshake, no ordering, no retransmits.
+
+| | TCP | UDP |
+| --- | --- | --- |
+| Setup | handshake, 1 RTT | none |
+| Delivery | every byte, in order, or an error | each message arrives or doesn't |
+| Used by | HTTP/1.1, HTTP/2, databases, SSH | DNS, video calls, games, QUIC (HTTP/3) |
+
+UDP fits when waiting is worse than losing data, or when the program handles reliability itself. A DNS lookup is one tiny question and answer; a handshake would double its cost, so the client just asks again if the answer doesn't come. A video call would rather drop a frame than freeze.
+
+## Making it private: TLS
+
+### The problem TLS solves
+
+Your packets cross machines you don't control: café Wi-Fi, your ISP, networks in between. Any of them could **read** the traffic (passwords, cookies), **change** it (inject scripts), or **pretend to be the server** (for example by faking a DNS answer). TLS (Transport Layer Security) gives three guarantees against exactly these:
+
+1. **Confidentiality**: the data is encrypted.
+2. **Integrity**: any change is detected and the connection is dropped.
+3. **Authentication**: the server proves it owns the name you asked for.
+
+TLS doesn't hide IP addresses, timing or rough sizes. The server name is usually visible too, sent in the clear so one IP address can host many sites (this is SNI). An extension called Encrypted Client Hello hides it when both sides support it.
+
+### Certificates and certificate authorities
+
+Encryption is useless if you are encrypting to the attacker. So how does the browser know that `104.20.23.154` really is `example.com`?
+
+With a **certificate**: a signed document saying "this public key belongs to `example.com`, valid between these dates". A **certificate authority** (CA) signs it after checking that the requester controls the domain. Your OS and browser ship a list of trusted root CAs, the **trust store**. Roots usually sign intermediates, which sign site certificates:
+
+<Diagram caption="A certificate chain. The client follows signatures up to a root it trusts.">{`
+ ┌──────────────────────────────────────────┐
+ │ Root CA          (in your trust store)   │
+ └─────────────────────┬────────────────────┘
+                       │ signs
+ ┌─────────────────────▼────────────────────┐
+ │ Intermediate CA  (sent by the server)    │
+ └─────────────────────┬────────────────────┘
+                       │ signs
+ ┌─────────────────────▼────────────────────┐
+ │ Leaf certificate (sent by the server)    │
+ │ names: example.com, *.example.com        │
+ │ public key, valid until a date           │
+ └──────────────────────────────────────────┘
+`}</Diagram>
+
+The client checks that the signatures lead to a trusted root, the dates are valid, and the name matches. Then the server signs part of the handshake with the private key that matches the certificate. Anyone can copy a certificate; only the real server has the key.
+
+A valid certificate proves "this server controls this name". It does not prove the site is honest. A phishing site at `examp1e-login.com` can have a perfectly valid certificate for its own name.
+
+### The TLS 1.3 handshake
+
+TLS 1.3 (RFC 8446, 2018) sets up a connection in one round trip. TLS 1.2 needed two.
+
+<Diagram caption="The TLS 1.3 handshake, simplified. Braces mean already encrypted.">{`
+ Client                                           Server
+   │                                                  │
+   │ ClientHello                                      │
+   │  versions and ciphers I support                  │
+   │  my key share                                    │
+   │  server name (SNI): example.com                  │
+   │  protocols (ALPN): h2, http/1.1                  │
+   │ ───────────────────────────────────────────────▶ │
+   │                                                  │
+   │                                      ServerHello │
+   │                  chosen cipher, server key share │
+   │      {certificate chain, signature, Finished}    │
+   │ ◀─────────────────────────────────────────────── │
+   │                                                  │
+   │ {Finished}  {GET / HTTP/1.1 ...}                 │
+   │ ───────────────────────────────────────────────▶ │
+`}</Diagram>
+
+How can two sides agree on a secret when every message can be read? The **key shares** use Diffie-Hellman key exchange: each side sends a public value and keeps a private one, and combining your private value with the other side's public value gives both the same secret. Someone who saw only the public values can't compute it.
+
+Because the key share is in the very first message, the server's reply is already encrypted, and the client sends its HTTP request right after Finished. **ALPN** agrees on the HTTP version (`h2` is HTTP/2) inside the same handshake, at no extra cost.
+
+### Seeing TLS from Go
+
+`httptest` can start an HTTPS server with a throwaway certificate, so you can watch a certificate check fail and succeed locally. `EnableHTTP2` makes the server offer `h2` during the TLS handshake. The program asks twice: once with `http.DefaultClient`, which doesn't trust the test certificate, and once with `srv.Client()`, which trusts it the way a browser trusts a real CA:
+
+```go
+// file: main.go
+package main
+
+import (
+  "crypto/tls"
+  "fmt"
+  "net/http"
+  "net/http/httptest"
+)
+
+func main() {
+  srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintln(w, "secret stuff")
+  }))
+  srv.EnableHTTP2 = true
+  srv.StartTLS()
+  defer srv.Close()
+
+  untrustingClient := http.DefaultClient
+  _, err := untrustingClient.Get(srv.URL)
+  fmt.Println("untrusted:", err)
+
+  trustingClient := srv.Client()
+  resp, err := trustingClient.Get(srv.URL)
+  if err != nil {
+    panic(err)
+  }
+  defer resp.Body.Close()
+
+  st := resp.TLS
+  cert := st.PeerCertificates[0]
+  fmt.Println("version: ", tls.VersionName(st.Version))
+  fmt.Println("cipher:  ", tls.CipherSuiteName(st.CipherSuite))
+  fmt.Println("ALPN:    ", st.NegotiatedProtocol, "->", resp.Proto)
+  fmt.Println("issuer:  ", cert.Issuer.Organization)
+  fmt.Println("names:   ", cert.DNSNames, cert.IPAddresses)
+  fmt.Println("expires: ", cert.NotAfter.Format("2006-01-02"))
+}
+```
+
+```text
+untrusted: Get "https://127.0.0.1:58399": tls: failed to verify certificate: x509: certificate signed by unknown authority
+2026/10/06 17:21:20 http: TLS handshake error from 127.0.0.1:58400: remote error: tls: bad certificate
+version:  TLS 1.3
+cipher:   TLS_AES_128_GCM_SHA256
+ALPN:     h2 -> HTTP/2.0
+issuer:   [Acme Co]
+names:    [example.com *.example.com] [127.0.0.1 ::1]
+expires:  2084-01-29
+```
+
+- **Line 1**: the test certificate is signed by a made-up CA ("Acme Co") that isn't in the trust store, so `untrustingClient` refuses. A browser shows its warning page for the same reason.
+- **Line 2**: the server's log of the same event. Seeing "bad certificate" in real server logs means some client doesn't trust your certificate.
+- **The rest**: `trustingClient` trusts the test CA. TLS 1.3 was chosen and ALPN agreed on `h2`. One certificate can cover several names, wildcards and IP addresses.
+
+**HTTPS** is just HTTP inside a TLS connection, by default on port 443. Methods, headers and status codes don't change; they are just unreadable on the way.
+
+### Putting a price on each step
+
+`net/http/httptrace` attaches callbacks to the stages of a request. This produced the numbers in the mental model. It calls a real host, so your times will differ (mine changed between runs too):
+
+```go
+// file: main.go
+package main
+
+import (
+  "crypto/tls"
+  "fmt"
+  "io"
+  "net/http"
+  "net/http/httptrace"
+  "time"
+)
+
+func main() {
+  client := &http.Client{Timeout: 10 * time.Second}
+  for i := range 2 {
+    fetch(client, fmt.Sprintf("request %d", i+1))
+  }
+}
+
+func fetch(client *http.Client, label string) {
+  var start, dnsStart, connStart, tlsStart time.Time
+  ms := func(since time.Time) string {
+    return fmt.Sprintf("%5.1fms", float64(time.Since(since).Microseconds())/1000)
+  }
+  trace := &httptrace.ClientTrace{
+    DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+    DNSDone: func(httptrace.DNSDoneInfo) {
+      fmt.Println("  DNS lookup   ", ms(dnsStart))
+    },
+    ConnectStart: func(_, _ string) { connStart = time.Now() },
+    ConnectDone: func(_, addr string, _ error) {
+      fmt.Println("  TCP connect  ", ms(connStart), "to", addr)
+    },
+    TLSHandshakeStart: func() { tlsStart = time.Now() },
+    TLSHandshakeDone: func(cs tls.ConnectionState, _ error) {
+      fmt.Println("  TLS handshake", ms(tlsStart), tls.VersionName(cs.Version))
+    },
+    GotConn: func(info httptrace.GotConnInfo) {
+      fmt.Println("  got conn      reused =", info.Reused)
+    },
+    GotFirstResponseByte: func() {
+      fmt.Println("  first byte   ", ms(start), "after start")
+    },
+  }
+  req, err := http.NewRequest("GET", "https://example.com/", nil)
+  if err != nil {
+    panic(err)
+  }
+  req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+  fmt.Println(label)
+  start = time.Now()
+  resp, err := client.Do(req)
+  if err != nil {
+    fmt.Println("  error:", err)
+    return
+  }
+  io.Copy(io.Discard, resp.Body)
+  resp.Body.Close()
+  fmt.Println("  status       ", resp.Status, resp.Proto)
+}
+```
+
+Two things to notice in its output. TLS (25.1 ms) took far longer than TCP (6.6 ms) though both are one round trip, because TLS also computes: the key exchange and checking the certificate chain. And the second request printed no DNS, TCP or TLS lines: the client reused the connection. That only works because the program read the body to the end and closed it. More on that in the Go section.
+
+## Speaking HTTP
+
+### A request and a response, by hand
+
+Now there is a private, reliable pipe. HTTP is the agreement on what the bytes mean. HTTP/1.1 is plain text, so you can speak it by hand. This program opens a TCP connection with `net.Dial` and writes the request as a string, against its own server on `127.0.0.1` so the output is reproducible. Port 0 in `anyFreePort` tells the OS to pick any free port. The client side uses no HTTP library at all:
+
+```go
+// file: main.go
+package main
+
+import (
+  "fmt"
+  "io"
+  "net"
+  "net/http"
+)
+
+const anyFreePort = "127.0.0.1:0"
+
+func main() {
+  conn, err := net.Dial("tcp", startLocalServer())
+  if err != nil {
+    panic(err)
+  }
+  defer conn.Close()
+
+  req := "GET /items/42 HTTP/1.1\r\n" +
+    "Host: shop.example.com\r\n" +
+    "User-Agent: by-hand/1.0\r\n" +
+    "Connection: close\r\n" +
+    "\r\n"
+  if _, err := io.WriteString(conn, req); err != nil {
+    panic(err)
+  }
+
+  rawResponse, err := io.ReadAll(conn)
+  if err != nil {
+    panic(err)
+  }
+  fmt.Printf("%s", rawResponse)
+}
+
+func startLocalServer() (addr string) {
+  ln, err := net.Listen("tcp", anyFreePort)
+  if err != nil {
+    panic(err)
+  }
+  go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    fmt.Fprintf(w, "hello, you asked for %s\n", r.URL.Path)
+  }))
+  return ln.Addr().String()
+}
+```
+
+```text
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Date: Tue, 06 Oct 2026 15:21:17 GMT
+Content-Length: 31
+Connection: close
+
+hello, you asked for /items/42
+```
+
+The request, line by line:
+
+- `GET /items/42 HTTP/1.1` is the **request line**: method, target (path and query), version.
+- `Host: shop.example.com` names the site. One IP address often serves many sites, and this header tells them apart. HTTP/1.1 requires it.
+- `Connection: close` asks the server to close the connection after responding. That is what lets `io.ReadAll` finish; otherwise the connection would stay open for another request.
+- An **empty line** ends the headers. Lines end in `\r\n`, not just `\n`. A `POST` would put its body after the empty line.
+
+The response mirrors it: a **status line** (version, code, reason phrase), headers, an empty line, the body. `Content-Length: 31` tells the client exactly where the body ends (30 characters of text plus a newline). `Date` was added by Go and will differ in your run.
+
+The server never resolved `shop.example.com`; it only read the `Host` header. DNS and HTTP are separate layers, which is why you can test a site before its DNS points to it.
+
+### Methods: safe and idempotent
+
+The method says what to do with the resource. What matters most are two properties from the HTTP specification (RFC 9110):
+
+- **Safe**: the client only asks to read; no change is requested.
+- **Idempotent**: doing it twice has the same effect on the server as doing it once. Responses may differ; the end state doesn't.
+
+| Method | Meaning | Safe | Idempotent |
+| --- | --- | --- | --- |
+| `GET` | read the resource | yes | yes |
+| `HEAD` | like `GET`, headers only | yes | yes |
+| `OPTIONS` | what is supported | yes | yes |
+| `PUT` | replace the resource with this body | no | yes |
+| `DELETE` | remove the resource | no | yes |
+| `POST` | process this body, often "create" | no | no |
+| `PATCH` | apply a partial change | no | not guaranteed |
+
+`DELETE /items/42` twice: the first returns 204, the second may return 404, but the item is gone either way. `POST /orders` twice creates two orders.
+
+This matters because the network forces retries on you. A request can time out **after** the server did the work. An idempotent request can simply be resent; a non-idempotent one might charge a card twice. Clients rely on this: browsers ask before resubmitting a `POST`, and Go's transport only retries a request that failed on a reused connection if the request is idempotent.
+
+Safety matters too. Crawlers, link previews and browser prefetching follow `GET` links freely, so a `GET /items/42/delete` will eventually be "clicked" by a robot.
+
+### Status codes
+
+The first digit gives the family, so a client that doesn't know a code still knows what kind of answer it is:
+
+| Family | Meaning | Codes you will use |
+| --- | --- | --- |
+| 1xx | informational | rarely seen directly |
+| 2xx | success | `200 OK`, `201 Created`, `204 No Content` |
+| 3xx | go elsewhere | `301`/`308` moved permanently, `302`/`307` temporarily, `304 Not Modified` |
+| 4xx | client's fault | `400` bad input, `401` not authenticated, `403` not allowed, `404` not found, `405` wrong method, `409` conflict, `429` too many requests |
+| 5xx | server's fault | `500` bug, `502` bad gateway, `503` unavailable, `504` gateway timeout |
+
+**401 versus 403**: 401 is "I don't know who you are", 403 is "I know who you are, and no". **4xx versus 5xx**: resending the same request won't fix a 4xx; a 5xx might clear up later.
+
+`502` and `504` usually come from a proxy or load balancer, not your app: "the server behind me sent garbage" (502) or "didn't answer in time" (504). Look at the hop between the proxy and your app.
+
+### Headers that matter
+
+Headers are case-insensitive `Name: value` lines. A handful do most of the work:
+
+| Header | Sent in | What it does |
+| --- | --- | --- |
+| `Host` | request | which site on this server |
+| `Content-Type` | both | body format, such as `application/json` |
+| `Accept` | request | formats the client can read |
+| `Authorization` | request | credentials, such as `Bearer <token>` |
+| `Set-Cookie` / `Cookie` | response / request | server sets a value, browser sends it back on later requests |
+| `Cache-Control` | both | who may cache it and how long: `max-age=300`, `no-store` |
+| `ETag` / `If-None-Match` | response / request | a version tag; "send it only if changed", else `304` |
+| `Location` | response | where the new resource is (with 201) or where to go (with 3xx) |
+
+Cookies are how a browser stays logged in when each request stands alone. Mark session cookies `HttpOnly` (scripts can't read them), `Secure` (HTTPS only) and `SameSite` (not sent on most cross-site requests).
+
+Real response headers from `https://example.com/`, captured with `curl -v`:
+
+```text
+< HTTP/2 200
+< content-type: text/html; charset=utf-8
+< server: cloudflare
+< allow: GET, HEAD
+< age: 11539
+< cf-cache-status: HIT
+< alt-svc: h3=":443"; ma=86400
+```
+
+Names are lowercase because HTTP/2 requires it. `cf-cache-status: HIT` and `age: 11539` mean the page came from Cloudflare's cache, where it had sat for about three hours; the site's own server never saw the request. `alt-svc` advertises HTTP/3 on port 443.
+
+### Keeping connections open
+
+Since connections are expensive, HTTP/1.1 keeps them open by default (**keep-alive**), and `Content-Length` tells the client where one response ends so the next can follow. But on one HTTP/1.1 connection, requests go strictly one after another, so a slow response blocks those behind it. Browsers work around that by opening several connections per host (commonly six), each paying its own handshakes.
+
+### HTTP/1.1, HTTP/2 and HTTP/3
+
+The newer versions keep the same meaning (methods, codes, headers) and change how the bytes travel:
+
+<Diagram caption="Same requests, three ways of carrying them.">{`
+ HTTP/1.1   one request at a time on each connection
+   conn 1   [GET a ──── resp a][GET b ──── resp b]
+   conn 2   [GET c ────────────────── resp c]
+   conn 3   [GET d ──── resp d]     (several connections)
+
+ HTTP/2     many streams interleaved on ONE TCP connection
+   conn 1   [a][b][c][a][d][b][c][a][d] ...
+            one lost TCP packet stalls every stream
+
+ HTTP/3     the same streams, carried by QUIC over UDP
+   conn 1   [a][b][c][a][d][b][c][a][d] ...
+            a lost packet stalls only its own stream
+`}</Diagram>
+
+**HTTP/2** (RFC 9113) uses binary frames. Each request and response is a **stream**, and frames from many streams are interleaved on one connection. This **multiplexing** means a slow response no longer blocks the rest, and one connection replaces six. Headers are compressed too.
+
+But HTTP/2 still runs on TCP. One lost packet stalls every stream until the retransmit arrives, which hurts on lossy mobile networks.
+
+**HTTP/3** (RFC 9114) runs on **QUIC** (RFC 9000), a transport built on UDP that handles reliability per stream, so a loss delays only its own stream. QUIC also merges the transport and TLS 1.3 handshakes into one round trip, and a connection can survive switching from Wi-Fi to mobile data. Browsers usually connect over TCP first, see an `alt-svc: h3` header like the one above, and try QUIC next time.
+
+## HTTP in Go: server, tests and a careful client
+
+### A small server with Go 1.22 routing
+
+Since Go 1.22, `http.ServeMux` patterns can include a method and path wildcards, so a small API needs no third-party router:
+
+```go
+// file: main.go
+package main
+
+import (
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "strconv"
+  "sync"
+  "time"
+)
+
+type Item struct {
+  ID    int    `json:"id"`
+  Name  string `json:"name"`
+  Price int    `json:"price_cents"`
+}
+
+type store struct {
+  mu     sync.Mutex
+  items  map[int]Item
+  nextID int
+}
+
+func newMux(s *store) *http.ServeMux {
+  mux := http.NewServeMux()
+  mux.HandleFunc("GET /items/{id}", s.getItem)
+  mux.HandleFunc("POST /items", s.createItem)
+  return mux
+}
+
+func (s *store) getItem(w http.ResponseWriter, r *http.Request) {
+  id, err := strconv.Atoi(r.PathValue("id"))
+  if err != nil {
+    http.Error(w, "id must be a number", http.StatusBadRequest)
+    return
+  }
+  s.mu.Lock()
+  it, ok := s.items[id]
+  s.mu.Unlock()
+  if !ok {
+    http.Error(w, "no such item", http.StatusNotFound)
+    return
+  }
+  w.Header().Set("Content-Type", "application/json")
+  json.NewEncoder(w).Encode(it)
+}
+
+func (s *store) createItem(w http.ResponseWriter, r *http.Request) {
+  var in Item
+  if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Name == "" {
+    http.Error(w, "body must be JSON with a name", http.StatusBadRequest)
+    return
+  }
+  s.mu.Lock()
+  s.nextID++
+  in.ID = s.nextID
+  s.items[in.ID] = in
+  s.mu.Unlock()
+  w.Header().Set("Content-Type", "application/json")
+  w.Header().Set("Location", fmt.Sprintf("/items/%d", in.ID))
+  w.WriteHeader(http.StatusCreated)
+  json.NewEncoder(w).Encode(in)
+}
+
+func main() {
+  s := &store{items: map[int]Item{}}
+  srv := &http.Server{
+    Addr:              "127.0.0.1:8089",
+    Handler:           newMux(s),
+    ReadHeaderTimeout: 5 * time.Second,
+    ReadTimeout:       10 * time.Second,
+    WriteTimeout:      10 * time.Second,
+    IdleTimeout:       60 * time.Second,
+  }
+  log.Println("listening on", srv.Addr)
+  log.Fatal(srv.ListenAndServe())
+}
+```
+
+- `"GET /items/{id}"` has a method and a **wildcard**. `{id}` matches one path segment and `r.PathValue("id")` returns it. A non-number is the client's mistake, so the answer is 400.
+- `newMux` is separate from `main` so tests can use the same handler without a real server.
+- `createItem` returns `201 Created` with a `Location` header. Order matters: headers, then `WriteHeader`, then the body. Headers set after `WriteHeader` are ignored.
+- The server timeouts matter. `ReadHeaderTimeout` stops a client holding a connection by sending headers one byte at a time (the slowloris attack). `IdleTimeout` closes quiet keep-alive connections. `http.ListenAndServe` and a zero `http.Server` set none of them.
+- Binding to `127.0.0.1` accepts connections from this machine only.
+
+I ran it and called it with `curl -i`, which prints the status line and headers:
+
+```sh
+$ curl -i -X POST -H 'Content-Type: application/json' \
+    -d '{"name":"teapot","price_cents":1999}' http://127.0.0.1:8089/items
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /items/1
+Date: Tue, 06 Oct 2026 15:22:25 GMT
+Content-Length: 44
+
+{"id":1,"name":"teapot","price_cents":1999}
+
+$ curl -i http://127.0.0.1:8089/items/99
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Tue, 06 Oct 2026 15:22:25 GMT
+Content-Length: 13
+
+no such item
+
+$ curl -i -X DELETE http://127.0.0.1:8089/items/1
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+X-Content-Type-Options: nosniff
+Date: Tue, 06 Oct 2026 15:22:25 GMT
+Content-Length: 19
+
+Method Not Allowed
+```
+
+We never registered `DELETE`, yet the answer is `405`, not 404: the path exists, only the method is wrong, and `Allow` lists what would work. `HEAD` is there because a `GET` pattern also matches `HEAD`. Correct HTTP for free.
+
+### Testing with httptest
+
+`httptest.NewRecorder` calls a handler as a plain function, no network. `httptest.NewServer` starts a real server on a random local port:
+
+```go
+// file: main_test.go
+package main
+
+import (
+  "net/http/httptest"
+  "strings"
+  "testing"
+)
+
+func TestItemsAPI(t *testing.T) {
+  mux := newMux(&store{items: map[int]Item{}})
+
+  tests := []struct {
+    name, method, path, body string
+    wantStatus               int
+  }{
+    {"create", "POST", "/items", `{"name":"teapot","price_cents":1999}`, 201},
+    {"create without name", "POST", "/items", `{}`, 400},
+    {"fetch created", "GET", "/items/1", "", 200},
+    {"fetch missing", "GET", "/items/99", "", 404},
+    {"bad id", "GET", "/items/abc", "", 400},
+    {"wrong method", "DELETE", "/items/1", "", 405},
+  }
+  for _, tc := range tests {
+    t.Run(tc.name, func(t *testing.T) {
+      req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+      rec := httptest.NewRecorder()
+      mux.ServeHTTP(rec, req)
+      if rec.Code != tc.wantStatus {
+        t.Fatalf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus, rec.Body.String())
+      }
+    })
+  }
+}
+
+func TestOverRealHTTP(t *testing.T) {
+  srv := httptest.NewServer(newMux(&store{items: map[int]Item{}}))
+  defer srv.Close()
+
+  resp, err := srv.Client().Post(srv.URL+"/items", "application/json",
+    strings.NewReader(`{"name":"mug","price_cents":850}`))
+  if err != nil {
+    t.Fatal(err)
+  }
+  defer resp.Body.Close()
+  if got := resp.Header.Get("Location"); got != "/items/1" {
+    t.Fatalf("Location = %q, want /items/1", got)
+  }
+  t.Logf("server at %s answered %s", srv.URL, resp.Status)
+}
+```
+
+```text
+$ go test -v
+=== RUN   TestItemsAPI
+=== RUN   TestItemsAPI/create
+=== RUN   TestItemsAPI/create_without_name
+=== RUN   TestItemsAPI/fetch_created
+=== RUN   TestItemsAPI/fetch_missing
+=== RUN   TestItemsAPI/bad_id
+=== RUN   TestItemsAPI/wrong_method
+--- PASS: TestItemsAPI (0.00s)
+    --- PASS: TestItemsAPI/create (0.00s)
+    --- PASS: TestItemsAPI/create_without_name (0.00s)
+    --- PASS: TestItemsAPI/fetch_created (0.00s)
+    --- PASS: TestItemsAPI/fetch_missing (0.00s)
+    --- PASS: TestItemsAPI/bad_id (0.00s)
+    --- PASS: TestItemsAPI/wrong_method (0.00s)
+=== RUN   TestOverRealHTTP
+    main_test.go:48: server at http://127.0.0.1:58427 answered 201 Created
+--- PASS: TestOverRealHTTP (0.00s)
+PASS
+ok      itemsapi        0.442s
+```
+
+The table checks status codes because clients branch on them; they are part of the contract. The cases share one store and run in order ("fetch created" needs "create"). Fine here, but give each case its own store if you ever add `t.Parallel()`.
+
+### A client that gives up
+
+Back to the opening story. This program starts a server that takes 3 seconds to answer, like an overloaded dependency, and calls it two ways, each with a limit: a client-wide ceiling on the whole exchange, then a per-request deadline that comes from the caller's context:
+
+```go
+// file: main.go
+package main
+
+import (
+  "context"
+  "errors"
+  "fmt"
+  "io"
+  "net"
+  "net/http"
+  "net/http/httptest"
+  "time"
+)
+
+const slowAnswerDelay = 3 * time.Second
+
+func main() {
+  overloadedDependency := startSlowServer()
+  defer overloadedDependency.Close()
+
+  fmt.Println("default client timeout:", http.DefaultClient.Timeout)
+
+  callWithClientTimeout(overloadedDependency.URL)
+  callWithContextDeadline(overloadedDependency.URL)
+}
+
+func startSlowServer() *httptest.Server {
+  return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    clientGaveUp := r.Context().Done()
+    select {
+    case <-time.After(slowAnswerDelay):
+      fmt.Fprintln(w, "finally")
+    case <-clientGaveUp:
+    }
+  }))
+}
+
+func callWithClientTimeout(url string) {
+  client := &http.Client{Timeout: 500 * time.Millisecond}
+  start := time.Now()
+  _, err := client.Get(url)
+  fmt.Printf("client timeout after %s: %v\n", time.Since(start).Round(100*time.Millisecond), err)
+
+  var ne net.Error
+  fmt.Println("is a timeout:", errors.As(err, &ne) && ne.Timeout())
+}
+
+func callWithContextDeadline(url string) {
+  ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+  defer cancel()
+  req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+  start := time.Now()
+  resp, err := http.DefaultClient.Do(req)
+  if err == nil {
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+  }
+  fmt.Printf("context deadline after %s: %v\n", time.Since(start).Round(100*time.Millisecond),
+    errors.Is(err, context.DeadlineExceeded))
+}
+```
+
+```text
+default client timeout: 0s
+client timeout after 500ms: Get "http://127.0.0.1:58396": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+is a timeout: true
+context deadline after 200ms: true
+```
+
+The first line is the whole problem. `http.DefaultClient`, used by `http.Get`, has a timeout of `0s`, meaning no limit. Its transport gives up on connecting after 30 seconds and on the TLS handshake after 10, but once connected, nothing limits the wait for a response or the body.
+
+- `http.Client{Timeout: ...}` caps the **whole** exchange, including reading the body. Create one client and share it; it is safe for concurrent use.
+- `http.NewRequestWithContext` ties one request to a deadline from above. In a handler, pass `r.Context()`, so your outgoing call stops when your own caller gives up.
+
+The first error is a `net.Error` with `Timeout()` true; the second wraps `context.DeadlineExceeded`.
+
+### Reusing connections
+
+Go's `http.Transport` keeps a pool of idle connections per host. It can only return a connection to the pool after you **read the body to the end and close it**. In this program the good loop does both. The leaky loop throws the response away without touching the body, a classic bug:
+
+```go
+// file: main.go
+package main
+
+import (
+  "fmt"
+  "io"
+  "net"
+  "net/http"
+  "net/http/httptest"
+  "net/http/httptrace"
+  "sync/atomic"
+)
+
+func main() {
+  var newConns atomic.Int32
+  srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintln(w, "ok")
+  }))
+  srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+    if s == http.StateNew {
+      newConns.Add(1)
+    }
+  }
+  srv.Start()
+  defer srv.Close()
+
+  client := &http.Client{}
+  get := func(label string) *http.Response {
+    trace := &httptrace.ClientTrace{
+      GotConn: func(info httptrace.GotConnInfo) {
+        fmt.Printf("%-8s reused=%-5v local=%s\n", label, info.Reused, info.Conn.LocalAddr())
+      },
+    }
+    req, _ := http.NewRequest("GET", srv.URL, nil)
+    req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+    resp, err := client.Do(req)
+    if err != nil {
+      panic(err)
+    }
+    return resp
+  }
+
+  for i := range 3 {
+    resp := get(fmt.Sprintf("good-%d", i+1))
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+  }
+  for i := range 3 {
+    get(fmt.Sprintf("leaky-%d", i+1))
+  }
+  fmt.Println("TCP connections the server accepted:", newConns.Load())
+}
+```
+
+```text
+good-1   reused=false local=127.0.0.1:58403
+good-2   reused=true  local=127.0.0.1:58403
+good-3   reused=true  local=127.0.0.1:58403
+leaky-1  reused=true  local=127.0.0.1:58403
+leaky-2  reused=false local=127.0.0.1:58404
+leaky-3  reused=false local=127.0.0.1:58405
+TCP connections the server accepted: 3
+```
+
+The `local` port identifies the TCP connection. The good requests all used 58403: one handshake, three requests. `leaky-1` still got that pooled connection, but never closed its body, so the connection never went back. `leaky-2` and `leaky-3` each had to open a new one. Against a real HTTPS server, that is a full TCP and TLS setup per request.
+
+## REST: designing with resources
+
+### The problem REST solves
+
+HTTP gives you methods and status codes but not a layout for your API. Left alone, teams invent `POST /getItem`, `POST /deleteItem`, and `200 OK` with `{"error": "not found"}` in the body. Every API must be learned from scratch, and caches, proxies and retry logic can't understand any of them.
+
+REST (Representational State Transfer) is an architectural style Roy Fielding described in his 2000 dissertation to explain why the web scales. Its core ideas:
+
+- **Resources.** Each thing the API is about gets a URL: `/items/42`. URLs are nouns; the method is the verb.
+- **Representations.** You exchange representations of a resource, such as JSON or HTML, named by `Content-Type` and requested with `Accept`.
+- **Statelessness.** Each request carries everything needed to understand it, including who is asking. The server keeps no memory of the conversation between requests. Data in a database is fine; "remember this client is on page 3" is not.
+- **A uniform interface.** The same few methods mean the same thing everywhere. That is how a cache knows a `GET` can be stored and a client knows a `PUT` can be retried, without knowing your app.
+- **Hypermedia.** Responses link to related resources and next actions. Most "REST" APIs skip this part.
+
+Statelessness is what architects lean on most. If no server holds per-client memory, any server can handle any request, so you can run ten copies behind a load balancer and lose one without losing anyone's session.
+
+### A small design example
+
+A REST API for the shop, extending the items server:
+
+| Method | Path | Meaning | Success |
+| --- | --- | --- | --- |
+| `GET` | `/items` | list items (paginated) | `200` |
+| `GET` | `/items/{id}` | one item | `200`, or `404` |
+| `POST` | `/items` | create; the server picks the ID | `201` + `Location` |
+| `PUT` | `/items/{id}` | replace the item | `200` |
+| `PATCH` | `/items/{id}` | change some fields | `200` |
+| `DELETE` | `/items/{id}` | remove the item | `204` |
+| `POST` | `/orders` | place an order | `201` + `Location` |
+| `GET` | `/orders/{id}` | an order and its status | `200` |
+| `POST` | `/orders/{id}/cancellation` | ask to cancel | `201`, or `409` if shipped |
+
+- **Collection and member.** `POST` goes to the collection `/items` because the client doesn't know the new ID yet; `Location` tells it.
+- **Actions.** "Cancel" doesn't map to a method. Treating the cancellation as a resource you create is one REST answer; `PATCH /orders/42` with a new status is another. `POST /cancelOrder?id=42` hides the resource in a parameter.
+- **409 Conflict** means "valid request, but it clashes with the resource's current state", which lets the client show a precise message.
+- **Placing an order is a POST**, so a retry could create a second order. A common fix: the client sends a unique `Idempotency-Key` header, and the server stores the result under it and replays it on a repeat. Payment APIs such as Stripe's popularised this, and an IETF draft describes it. You'll build one in the stretch exercise.
+
+The exchange looks like this:
+
+```http
+POST /orders HTTP/1.1
+Host: shop.example.com
+Content-Type: application/json
+Authorization: Bearer <token>
+Idempotency-Key: 7f9c2b1e-checkout-1
+
+{"items": [{"item_id": 42, "quantity": 2}]}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /orders/1007
+Content-Type: application/json
+
+{"id": 1007, "status": "placed", "total_cents": 3998}
+```
+
+### What REST is not
+
+- **Not "JSON over HTTP".** JSON from `POST /doThing` endpoints is RPC over HTTP.
+- **Not your tables with URLs on them.** An "order" resource may draw on five tables, and some tables should never be exposed.
+- **Not a standard.** There is no spec or validator. Fielding has argued that APIs without hypermedia aren't REST; most people call them RESTful anyway.
+- **Not the only good choice.** gRPC suits many internal service calls, and GraphQL suits clients that need flexible queries. Choose on purpose.
+
+Pagination, versioning and error formats come in the Level 1 lesson "API design: REST, pagination, versioning, error handling".
+
+## Common mistakes
+
+<Callout kind="pitfall" title="Calling services with no timeout">
+
+`http.Get`, `http.Post` and `http.DefaultClient` have no overall timeout. A stalled dependency holds your goroutines until the process dies.
+
+This version goes through `http.DefaultClient`, so it has no timeout at all:
+
+```go
+resp, err := http.Get(url)
+```
+
+Instead, create one client with a timeout, once, and share it:
+
+```go
+var client = &http.Client{Timeout: 10 * time.Second}
+
+resp, err := client.Get(url)
+```
+
+</Callout>
+
+<Callout kind="pitfall" title="Not closing the response body">
+
+An unclosed body keeps its connection out of the pool, so later requests pay for new handshakes and connections pile up, as the reuse program showed.
+
+```go
+resp, err := client.Get(url)
+if err != nil {
+  return nil, err
+}
+defer resp.Body.Close()
+return io.ReadAll(resp.Body)
+```
+
+</Callout>
+
+<Callout kind="pitfall" title="Turning off certificate checks">
+
+Switching off verification to silence a dev certificate error removes TLS's third guarantee: the client will encrypt to an attacker without complaint. These lines have a habit of reaching production. Never ship this one:
+
+```go
+tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+```
+
+Fix the cause: add the right CA to the client's trust store, or fix the server's chain or name.
+
+</Callout>
+
+<Callout kind="pitfall" title="State changes behind GET">
+
+`GET /items/42/delete` will be followed by a crawler, a link-preview bot or a prefetching browser, and a cache may answer it without reaching your server. State changes belong behind `POST`, `PUT`, `PATCH` or `DELETE`.
+
+</Callout>
+
+<Callout kind="pitfall" title="200 OK with an error inside">
+
+`200` with `{"error": "not found"}` hides the failure from monitoring, retry logic and caches (which may store the "successful" error). Send the status that matches what happened, with details in the body.
+
+</Callout>
+
+<Callout kind="pitfall" title="Blindly retrying a POST">
+
+A timeout doesn't mean failure; it means you don't know. The server may have created the order just before your deadline. Retry only idempotent requests automatically, or make the operation idempotent with a key.
+
+</Callout>
+
+## How architects use this
+
+**Latency budgets.** If a page must load in 300 ms and users are 100 ms away, you can afford about three round trips in total. That rules out designs where the browser makes sequential calls on fresh connections, and argues for CDNs, regional deployments, warm connections and HTTP/2 or HTTP/3. Level 4's "SLIs, SLOs, error budgets" turns this into targets.
+
+**Caching in layers.** A response can come from the browser cache, a CDN edge or a reverse proxy before your app sees the request, like the `cf-cache-status: HIT` from `example.com`. `Cache-Control` is how you tell each layer what it may keep. Level 2's "Caching strategies and invalidation" builds on this.
+
+<Diagram caption="Where a request can be answered, and where TLS usually ends.">{`
+ ┌─────────┐   ┌──────────┐   ┌───────────────┐   ┌──────────────┐
+ │ Browser │──▶│ CDN edge │──▶│ Load balancer │──▶│ App servers  │
+ │ cache   │   │ cache    │   │ (TLS ends     │   │ x3, no local │
+ └─────────┘   └──────────┘   │  here)        │   │ session      │
+                              └───────────────┘   └──────┬───────┘
+                                                         ▼
+                                                  ┌──────────────┐
+                                                  │ Database     │
+                                                  └──────────────┘
+`}</Diagram>
+
+**Load balancers and TLS termination.** A layer 4 balancer forwards TCP connections blindly. A layer 7 balancer reads HTTP, so it can route by path or header, but to do that it must decrypt. That is **TLS termination**: certificates live on the balancer, and app servers see plain HTTP or a second, internal TLS connection. Statelessness lets it send any request to any server. Level 3's "Load balancing, API gateways, service discovery" and Level 4's "Networking: VPCs, subnets, CDN, ingress" go further.
+
+**Timeouts that nest.** Every hop has timeouts, and the outer one must be longer than the inner one plus retries. If the balancer gives up at 30 seconds while your app waits 60 on the database, users get 504s while servers keep working on answers nobody reads.
+
+**Idempotency for retries.** Networks drop requests, so retries are necessary, and a timeout never tells you whether the work happened. Architects decide what is safe to retry and make the rest idempotent. This feeds Level 3's "Resilience: retries, circuit breakers, bulkheads, backpressure" and "Distributed transactions: sagas, outbox pattern, idempotency".
+
+**DNS as an operations tool.** Traffic moves between data centres by changing DNS, so TTLs belong in the disaster recovery plan. A one-day TTL means a one-day failover.
+
+<Callout kind="architect">
+
+Trace one request through any system diagram and count the DNS lookups, new connections, TLS handshakes and sequential round trips. Then ask at each hop: what happens when it is slow, and what happens when the client retries? Those two questions answer most performance and reliability problems in web systems.
+
+</Callout>
+
+## Check yourself
+
+<Quiz questions={[
+  {
+    q: "A browser has the IP address for an https:// URL. What happens before any HTTP request is sent?",
+    options: [
+      "Nothing; the request goes out at once and TLS is set up in the response",
+      "A TCP handshake, then a TLS handshake over that connection",
+      "A TLS handshake, then a TCP handshake inside the encrypted channel",
+      "DNS already opened the connection, so only TLS remains",
+    ],
+    answer: 1,
+    why: "TLS runs on top of TCP (for HTTP/1.1 and HTTP/2), so TCP connects first, TLS sets up keys over it, and HTTP is sent inside TLS. DNS only returns an address.",
+  },
+  {
+    q: "You move your site and update its A record, which had a TTL of 86400. An hour later some users still reach the old server. Why?",
+    options: [
+      "The root servers haven't received the change yet",
+      "Resolvers cached the old answer and may keep it for up to a day",
+      "Their browsers use a CNAME instead of the A record",
+      "TCP keeps connections to the old IP open for 24 hours",
+    ],
+    answer: 1,
+    why: "The TTL tells every cache how long it may keep an answer. Lower it well before a move.",
+  },
+  {
+    q: "Which method is idempotent but not safe?",
+    options: ["GET", "POST", "DELETE", "HEAD"],
+    answer: 2,
+    why: "DELETE changes state, so it isn't safe, but deleting twice leaves the same end state. GET and HEAD are both safe and idempotent; POST is neither.",
+  },
+  {
+    q: "A client sends POST /orders, times out after 5 seconds, and retries. What is the risk, and the fix?",
+    options: [
+      "None: a timeout proves the first request was lost",
+      "A duplicate order; send an idempotency key the server uses to replay the first result",
+      "The retry may arrive out of order; switch to HTTP/2",
+      "The server will reply 409, so the client must use PUT",
+    ],
+    answer: 1,
+    why: "After a timeout the client doesn't know whether the work happened. POST isn't idempotent, so a blind retry can duplicate it; a key lets the server recognise the retry.",
+  },
+  {
+    q: "Users see 504 Gateway Timeout, but your application logs show no errors. Where do you look first?",
+    options: [
+      "The users' DNS settings",
+      "The hop between the load balancer and your app: the app answers slower than the balancer's timeout",
+      "The TLS certificate, which has probably expired",
+      "Nowhere: 504 means the client sent a malformed request",
+    ],
+    answer: 1,
+    why: "504 usually comes from a proxy or load balancer whose upstream didn't answer in time. A slow app can cause it without logging any error.",
+  },
+  {
+    q: "On a mobile network that loses packets, why can HTTP/3 beat HTTP/2, when both multiplex requests on one connection?",
+    options: [
+      "Only HTTP/3 compresses headers",
+      "HTTP/3 skips encryption",
+      "HTTP/2 runs on TCP, where one lost packet stalls every stream; QUIC recovers each stream separately",
+      "HTTP/3 opens six connections instead of one",
+    ],
+    answer: 2,
+    why: "TCP delivers bytes strictly in order, so one loss blocks all HTTP/2 streams. QUIC tracks streams separately.",
+  },
+  {
+    q: "What does a valid TLS certificate for shop.example.com prove?",
+    options: [
+      "That a trustworthy company runs the site",
+      "That the server controls shop.example.com, as vouched for by a CA the client trusts",
+      "That the server's IP address is hidden",
+      "That the server has no known vulnerabilities",
+    ],
+    answer: 1,
+    why: "The CA checked control of the domain, and the server proves it holds the matching private key. Nothing more.",
+  },
+  {
+    q: "A Go service calls one API through a shared client, yet almost every call opens a new TCP connection. Most likely cause?",
+    options: [
+      "Setting a client timeout disables keep-alive",
+      "The code doesn't read and close resp.Body, so connections never return to the pool",
+      "Go only reuses connections over HTTP/2",
+      "The API's DNS TTL is too short",
+    ],
+    answer: 1,
+    why: "The transport reuses a connection only after its body is read and closed, as the reuse program showed.",
+  },
+]} />
+
+## Practice
+
+<Exercise title="Resolve names and classify the addresses" level="warm-up">
+
+Write a program `resolve` that takes host names as arguments, looks each up within a 5 second overall deadline, and prints every address marked IPv4 or IPv6, plus how long the lookup took. A failed lookup prints the error and moves on. Try `localhost`, `go.dev`, `example.com` and `nope.invalid`, then run it again and compare times.
+
+<Hint>
+
+Use `net.DefaultResolver.LookupHost` with a context from `context.WithTimeout`. `netip.ParseAddr` returns a `netip.Addr`, which has `Is4()`. Arguments are in `os.Args[1:]`.
+
+</Hint>
+
+<Solution>
+
+```go
+// file: main.go
+package main
+
+import (
+  "context"
+  "fmt"
+  "net"
+  "net/netip"
+  "os"
+  "time"
+)
+
+func main() {
+  if len(os.Args) < 2 {
+    fmt.Println("usage: resolve host [host...]")
+    os.Exit(2)
+  }
+  ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+  defer cancel()
+
+  for _, host := range os.Args[1:] {
+    start := time.Now()
+    addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+    took := time.Since(start).Round(time.Millisecond)
+    if err != nil {
+      fmt.Printf("%s: %v (%s)\n", host, err, took)
+      continue
+    }
+    fmt.Printf("%s (%s)\n", host, took)
+    for _, a := range addrs {
+      ip, err := netip.ParseAddr(a)
+      if err != nil {
+        continue
+      }
+      kind := "IPv6"
+      if ip.Is4() {
+        kind = "IPv4"
+      }
+      fmt.Printf("  %-5s %s\n", kind, ip)
+    }
+  }
+}
+```
+
+My run (yours will differ):
+
+```text
+$ go run . localhost go.dev example.com nope.invalid
+localhost (3ms)
+  IPv6  ::1
+  IPv4  127.0.0.1
+go.dev (9ms)
+  IPv4  216.239.32.21
+  IPv4  216.239.34.21
+  IPv4  216.239.38.21
+  IPv4  216.239.36.21
+  IPv6  2001:4860:4802:38::15
+  IPv6  2001:4860:4802:32::15
+  IPv6  2001:4860:4802:34::15
+  IPv6  2001:4860:4802:36::15
+example.com (42ms)
+  IPv4  104.20.23.154
+  IPv4  172.66.147.243
+  IPv6  2606:4700:10::ac42:93f3
+  IPv6  2606:4700:10::6814:179a
+nope.invalid: lookup nope.invalid: no such host (3ms)
+```
+
+One context covers the whole run, so 5 seconds is the total. For 5 seconds per name, create the context inside the loop. A second run is usually faster because answers are cached.
+
+</Solution>
+
+</Exercise>
+
+<Exercise title="Add PUT and DELETE, and prove they are idempotent" level="core">
+
+Extend the items server with:
+
+- `PUT /items/{id}`: replace an existing item with the JSON body. The URL's ID wins over any ID in the body. `404` if the item doesn't exist, `400` if the body has no name.
+- `DELETE /items/{id}`: remove the item and answer `204`, also when it is already gone.
+
+Write a test that sends the same `PUT` twice and the same `DELETE` twice and checks every status code.
+
+<Hint>
+
+Register `"PUT /items/{id}"` and `"DELETE /items/{id}"`. Go's `delete` on a missing map key does nothing, which already makes `DELETE` idempotent. In the test, a helper that runs a request through the mux with `httptest.NewRecorder` keeps each step to one line.
+
+</Hint>
+
+<Solution>
+
+```go
+// file: main.go
+package main
+
+import (
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "strconv"
+  "sync"
+  "time"
+)
+
+type Item struct {
+  ID    int    `json:"id"`
+  Name  string `json:"name"`
+  Price int    `json:"price_cents"`
+}
+
+type store struct {
+  mu     sync.Mutex
+  items  map[int]Item
+  nextID int
+}
+
+func newMux(s *store) *http.ServeMux {
+  mux := http.NewServeMux()
+  mux.HandleFunc("GET /items/{id}", s.getItem)
+  mux.HandleFunc("POST /items", s.createItem)
+  mux.HandleFunc("PUT /items/{id}", s.replaceItem)
+  mux.HandleFunc("DELETE /items/{id}", s.deleteItem)
+  return mux
+}
+
+func (s *store) getItem(w http.ResponseWriter, r *http.Request) {
+  id, err := strconv.Atoi(r.PathValue("id"))
+  if err != nil {
+    http.Error(w, "id must be a number", http.StatusBadRequest)
+    return
+  }
+  s.mu.Lock()
+  it, ok := s.items[id]
+  s.mu.Unlock()
+  if !ok {
+    http.Error(w, "no such item", http.StatusNotFound)
+    return
+  }
+  w.Header().Set("Content-Type", "application/json")
+  json.NewEncoder(w).Encode(it)
+}
+
+func (s *store) createItem(w http.ResponseWriter, r *http.Request) {
+  var in Item
+  if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Name == "" {
+    http.Error(w, "body must be JSON with a name", http.StatusBadRequest)
+    return
+  }
+  s.mu.Lock()
+  s.nextID++
+  in.ID = s.nextID
+  s.items[in.ID] = in
+  s.mu.Unlock()
+  w.Header().Set("Content-Type", "application/json")
+  w.Header().Set("Location", fmt.Sprintf("/items/%d", in.ID))
+  w.WriteHeader(http.StatusCreated)
+  json.NewEncoder(w).Encode(in)
+}
+
+func (s *store) replaceItem(w http.ResponseWriter, r *http.Request) {
+  idFromURL, err := strconv.Atoi(r.PathValue("id"))
+  if err != nil {
+    http.Error(w, "id must be a number", http.StatusBadRequest)
+    return
+  }
+  var replacement Item
+  if err := json.NewDecoder(r.Body).Decode(&replacement); err != nil || replacement.Name == "" {
+    http.Error(w, "body must be JSON with a name", http.StatusBadRequest)
+    return
+  }
+  replacement.ID = idFromURL
+  s.mu.Lock()
+  _, existed := s.items[idFromURL]
+  if !existed {
+    s.mu.Unlock()
+    http.Error(w, "no such item", http.StatusNotFound)
+    return
+  }
+  s.items[idFromURL] = replacement
+  s.mu.Unlock()
+  w.Header().Set("Content-Type", "application/json")
+  json.NewEncoder(w).Encode(replacement)
+}
+
+func (s *store) deleteItem(w http.ResponseWriter, r *http.Request) {
+  id, err := strconv.Atoi(r.PathValue("id"))
+  if err != nil {
+    http.Error(w, "id must be a number", http.StatusBadRequest)
+    return
+  }
+  s.mu.Lock()
+  delete(s.items, id)
+  s.mu.Unlock()
+  w.WriteHeader(http.StatusNoContent)
+}
+
+func main() {
+  s := &store{items: map[int]Item{}}
+  srv := &http.Server{
+    Addr:              "127.0.0.1:8089",
+    Handler:           newMux(s),
+    ReadHeaderTimeout: 5 * time.Second,
+    ReadTimeout:       10 * time.Second,
+    WriteTimeout:      10 * time.Second,
+    IdleTimeout:       60 * time.Second,
+  }
+  log.Println("listening on", srv.Addr)
+  log.Fatal(srv.ListenAndServe())
+}
+```
+
+```go
+// file: main_test.go
+package main
+
+import (
+  "net/http/httptest"
+  "strings"
+  "testing"
+)
+
+func TestReplaceAndDelete(t *testing.T) {
+  mux := newMux(&store{items: map[int]Item{}})
+  do := func(method, path, body string) *httptest.ResponseRecorder {
+    rec := httptest.NewRecorder()
+    mux.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(body)))
+    return rec
+  }
+
+  do("POST", "/items", `{"name":"teapot","price_cents":1999}`)
+
+  steps := []struct {
+    name, method, path, body string
+    want                     int
+  }{
+    {"replace", "PUT", "/items/1", `{"name":"teapot","price_cents":1499}`, 200},
+    {"same replace again", "PUT", "/items/1", `{"name":"teapot","price_cents":1499}`, 200},
+    {"replace missing", "PUT", "/items/9", `{"name":"ghost"}`, 404},
+    {"replace without name", "PUT", "/items/1", `{"price_cents":5}`, 400},
+    {"delete", "DELETE", "/items/1", "", 204},
+    {"delete again", "DELETE", "/items/1", "", 204},
+    {"fetch deleted", "GET", "/items/1", "", 404},
+  }
+  for _, st := range steps {
+    if got := do(st.method, st.path, st.body).Code; got != st.want {
+      t.Errorf("%s: %s %s = %d, want %d", st.name, st.method, st.path, got, st.want)
+    }
+  }
+}
+```
+
+```text
+$ go test .
+ok      itemscore       0.401s
+```
+
+`replaceItem` replaces the whole item, so sending the same `PUT` twice leaves the same state, which is what makes `PUT` idempotent. The ID comes from the URL, not the body, because the URL names the resource. "same replace again" and "delete again" are the two steps that prove it.
+
+Both choices here are design decisions. A `PUT` to a missing item could instead create it at that ID. A repeated `DELETE` could answer `404` and still be idempotent, because the server's state is the same. What matters is that clients can retry either one safely.
+
+</Solution>
+
+</Exercise>
+
+<Exercise title="An idempotency key middleware" level="stretch">
+
+Write middleware (a function from `http.Handler` to `http.Handler`) that makes `POST` safe to retry. If a request's `Idempotency-Key` header has been seen before, don't call the real handler: replay the stored status, headers and body, and add `Idempotent-Replayed: true`. Requests without the header pass through.
+
+Test it with a handler that creates numbered orders: send one key twice and a new key once, and show that only two orders were created.
+
+<Hint>
+
+`httptest.NewRecorder` works outside tests too: hand it to the real handler to capture status, headers and body, store them, then copy them to the real `http.ResponseWriter`. Guard the map with a mutex, and think about two retries with the same key arriving at once.
+
+</Hint>
+
+<Solution>
+
+```go
+// file: main.go
+package main
+
+import (
+  "fmt"
+  "io"
+  "maps"
+  "net/http"
+  "net/http/httptest"
+  "strings"
+  "sync"
+  "time"
+)
+
+type savedResponse struct {
+  status int
+  header http.Header
+  body   []byte
+}
+
+func replayRepeatedKeys(next http.Handler) http.Handler {
+  var oneKeyedRequestAtATime sync.Mutex
+  firstResponseByKey := map[string]savedResponse{}
+  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    key := r.Header.Get("Idempotency-Key")
+    if key == "" {
+      next.ServeHTTP(w, r)
+      return
+    }
+    oneKeyedRequestAtATime.Lock()
+    defer oneKeyedRequestAtATime.Unlock()
+    if s, ok := firstResponseByKey[key]; ok {
+      maps.Copy(w.Header(), s.header)
+      w.Header().Set("Idempotent-Replayed", "true")
+      w.WriteHeader(s.status)
+      w.Write(s.body)
+      return
+    }
+    rec := httptest.NewRecorder()
+    next.ServeHTTP(rec, r)
+    firstResponseByKey[key] = savedResponse{rec.Code, rec.Header().Clone(), rec.Body.Bytes()}
+    maps.Copy(w.Header(), rec.Header())
+    w.WriteHeader(rec.Code)
+    w.Write(rec.Body.Bytes())
+  })
+}
+
+func main() {
+  var mu sync.Mutex
+  orders := 0
+  create := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    mu.Lock()
+    orders++
+    id := orders
+    mu.Unlock()
+    w.WriteHeader(http.StatusCreated)
+    fmt.Fprintf(w, "order %d", id)
+  })
+  srv := httptest.NewServer(replayRepeatedKeys(create))
+  defer srv.Close()
+
+  client := &http.Client{Timeout: 5 * time.Second}
+  post := func(key string) {
+    req, _ := http.NewRequest("POST", srv.URL, strings.NewReader(`{"sku":"tea"}`))
+    req.Header.Set("Idempotency-Key", key)
+    resp, err := client.Do(req)
+    if err != nil {
+      panic(err)
+    }
+    defer resp.Body.Close()
+    body, _ := io.ReadAll(resp.Body)
+    fmt.Printf("key=%s -> %d %s (replayed=%q)\n", key, resp.StatusCode, body, resp.Header.Get("Idempotent-Replayed"))
+  }
+  const firstOrderKey, secondOrderKey = "a1", "b2"
+  post(firstOrderKey)
+  post(firstOrderKey)
+  post(secondOrderKey)
+  mu.Lock()
+  fmt.Println("orders actually created:", orders)
+  mu.Unlock()
+}
+```
+
+```text
+key=a1 -> 201 order 1 (replayed="")
+key=a1 -> 201 order 1 (replayed="true")
+key=b2 -> 201 order 2 (replayed="")
+orders actually created: 2
+```
+
+`main` sends the first order, retries it with the same key the way a client does after a timeout, then sends a genuinely new order. The retry got the same answer as the first attempt, and the handler ran only twice. Holding the lock for the whole request stops two simultaneous retries from both running the handler, but it also makes every keyed request wait for every other one.
+
+A production version would lock per key, keep saved responses in a shared store such as a database or Redis (with an expiry) so every server behind the load balancer sees them, and record a fingerprint of the body so a key reused with a different body gets an error.
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+<Recap>
+
+- Pressing Enter on an `https://` URL means: DNS finds the address, TCP opens a reliable stream, TLS makes it private and checks the server, then HTTP asks and answers.
+- DNS is a cached, distributed tree. The TTL sets how long every cache keeps an answer, so plan TTLs before you move anything.
+- New connections cost round trips (TCP 1, TLS 1.3 1, then the request), and distance sets the RTT. Reuse connections, and close response bodies so Go can.
+- TLS gives confidentiality, integrity and server authentication. A certificate proves control of a name and nothing more.
+- Safe and idempotent methods are what make caching and retries possible. Status codes are part of your API's contract.
+- HTTP/2 multiplexes streams on one TCP connection; HTTP/3 does it over QUIC so one lost packet doesn't stall them all.
+- In Go: route with patterns like `GET /items/{id}`, test with `httptest`, set server timeouts, and never call a service without a client timeout.
+- REST means resources at URLs, representations, stateless requests and a uniform interface. Statelessness lets any server behind a load balancer answer.
+
+</Recap>
+
+## Go further
+
+- MDN Web Docs, [HTTP](https://developer.mozilla.org/en-US/docs/Web/HTTP): the reference for headers, status codes and caching.
+- Ilya Grigorik, *High Performance Browser Networking*, free at [hpbn.co](https://hpbn.co/): TCP, TLS, HTTP/2 and latency, with numbers.
+- [Routing Enhancements for Go 1.22](https://go.dev/blog/routing-enhancements) on the Go blog, and the [net/http](https://pkg.go.dev/net/http), [net/http/httptest](https://pkg.go.dev/net/http/httptest) and [net/http/httptrace](https://pkg.go.dev/net/http/httptrace) docs.
+- The specifications: [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) (HTTP semantics), [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) (caching), [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) (HTTP/2), [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) (HTTP/3), [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) (TLS 1.3), [RFC 9293](https://www.rfc-editor.org/rfc/rfc9293) (TCP), [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035) (DNS), [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986) (URIs).
+- Roy Fielding, *Architectural Styles and the Design of Network-based Software Architectures* (dissertation, 2000), chapter 5, where REST is defined.
