@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ProgressProvider } from "@/lib/progress";
-import { SiteHeader } from "@/components/SiteHeader";
+import { AppShell } from "@/components/AppShell";
 import { themeScript } from "@/lib/theme";
 import "./globals.css";
 
@@ -22,8 +22,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body>
         <ProgressProvider>
-          <SiteHeader />
-          {children}
+          <AppShell>{children}</AppShell>
         </ProgressProvider>
       </body>
     </html>

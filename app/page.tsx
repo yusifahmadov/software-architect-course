@@ -1,5 +1,5 @@
-import { Home } from "@/components/Home";
+import { LearningPath } from "@/components/LearningPath";
 
 export default function Page() {
-  return <Home />;
+  return <LearningPath />;
 }
